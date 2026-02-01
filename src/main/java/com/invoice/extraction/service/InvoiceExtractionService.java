@@ -2,7 +2,6 @@ package com.invoice.extraction.service;
 
 import com.invoice.extraction.entity.*;
 import com.invoice.extraction.model.ExtractionResult;
-import com.invoice.extraction.repository.TenantRadioConfigRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -13,83 +12,77 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 
 /**
- * Top-level orchestrator — UPDATED to route TV vs Radio correctly.
+ * SIMPLIFIED Top-level orchestrator - TRUE MULTI-TENANT DESIGN
  *
- * The routing decision is simple:
- *   - If the identified tenant has a row in tenant_radio_configs → RadioExtractionEngine
- *   - Otherwise → GenericExtractionEngine (TV)
+ * ═══════════════════════════════════════════════════════════════════════
+ * BEFORE (Complex, Non-Scalable):
+ * ═══════════════════════════════════════════════════════════════════════
+ * - TV invoices → GenericExtractionEngine
+ * - Radio invoices → RadioExtractionEngine (special case!)
+ * - Income Tax → Need another special engine?
+ * - New format → Need yet another engine?
  *
- * This is the ONLY place that knows about the two engines.
- * Everything downstream is tenant-config-driven.
+ * ═══════════════════════════════════════════════════════════════════════
+ * AFTER (Simple, Truly Multi-Tenant):
+ * ═══════════════════════════════════════════════════════════════════════
+ * - ALL invoices → GenericExtractionEngine
+ * - ALL behavior → Database configuration
+ * - NO special logic for any format
+ * - Add new format → Just add database config
+ *
+ * The engine is "generic" because it handles both:
+ * 1. Flat invoices (TV): Each row is independent
+ * 2. Hierarchical invoices (Radio): Rows inherit context
+ *
+ * The difference is purely configuration (is_context field).
  */
 @Service
 @Slf4j
 public class InvoiceExtractionService {
 
     private final TenantIdentificationService identificationService;
-    private final GenericExtractionEngine tvEngine;
-    private final RadioExtractionEngine radioEngine;
-    private final TenantRadioConfigRepository radioConfigRepo;
+    private final GenericExtractionEngine engine;
 
     public InvoiceExtractionService(
             TenantIdentificationService identificationService,
-            GenericExtractionEngine tvEngine,
-            RadioExtractionEngine radioEngine,
-            TenantRadioConfigRepository radioConfigRepo) {
+            GenericExtractionEngine engine) {
 
         this.identificationService = identificationService;
-        this.tvEngine = tvEngine;
-        this.radioEngine = radioEngine;
-        this.radioConfigRepo = radioConfigRepo;
+        this.engine = engine;
     }
 
+    /**
+     * Single extraction method for ALL invoice types.
+     * No routing logic. No special cases. Just extract.
+     */
     public ExtractionResult extract(MultipartFile file) throws Exception {
-        // 1. Pull text out of PDF
+        // 1. Extract text from PDF
         String pdfText = extractText(file);
 
         if (pdfText == null || pdfText.isBlank()) {
             return ExtractionResult.empty("PDF contains no extractable text");
         }
 
-        // 2. Identify tenant
+        // 2. Identify tenant (TV, Radio, Income Tax, etc.)
         InvoiceTenant tenant = identificationService.identifyTenant(pdfText)
                 .orElseThrow(() -> new RuntimeException(
                         "Could not identify invoice type. No tenant matched."));
 
         log.info("Identified tenant: {} for file: {}", tenant.getTenantKey(), file.getOriginalFilename());
 
-        // 3. Route to the correct engine
-        ExtractionResult result = isRadioTenant(tenant)
-                ? radioEngine.extract(pdfText, tenant)
-                : tvEngine.extract(pdfText, tenant);
+        // 3. Extract using the unified engine
+        //    The engine automatically handles context fields if the tenant has them
+        ExtractionResult result = engine.extract(pdfText, tenant);
 
-        // 4. QR decode for summary if any block has qr_enabled
-        // tenant.getBlockConfigs().stream()
-        //         .filter(TenantBlockConfig::isQrEnabled)
-        //         .findFirst()
-        //         .ifPresent(cfg -> {
-        //             try {
-        //                 Double qrAmount = qrService.tryQrDecode(file);
-        //                 if (qrAmount != null) {
-        //                     result.setQrFinalAmount(qrAmount);
-        //                     log.info("QR decode succeeded: {}", qrAmount);
-        //                 }
-        //             } catch (Exception e) {
-        //                 log.warn("QR extraction failed: {}", e.getMessage());
-        //             }
-        //         });
+        log.info("Extraction completed: {} blocks extracted, accuracy: {}%",
+                result.getBlockResults().size(), String.format("%.1f", result.getAccuracy()));
 
         return result;
     }
 
     /**
-     * A tenant is "radio" if it has a row in tenant_radio_configs.
-     * This is the single source of truth for routing — no hardcoded tenant keys.
+     * Extract text from PDF using PDFBox
      */
-    private boolean isRadioTenant(InvoiceTenant tenant) {
-        return radioConfigRepo.existsByTenantId(tenant.getId());
-    }
-
     private String extractText(MultipartFile file) throws Exception {
         try (PDDocument doc = Loader.loadPDF(
                 new RandomAccessReadBuffer(file.getInputStream()))) {
