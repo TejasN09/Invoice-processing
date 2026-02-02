@@ -12,46 +12,39 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * IMPROVED UNIFIED EXTRACTION ENGINE
+ * TRULY UNIFIED EXTRACTION ENGINE
+ * Direct translation of RadioInvoiceExtractorService.processRows() to be config-driven
  * 
- * Key Improvements:
- * 1. Better line normalization and preprocessing
- * 2. Improved context field detection
- * 3. Smarter row boundary detection
- * 4. Better handling of multi-line rows
- * 5. Enhanced pattern matching with fallback strategies
+ * THE KEY FIX: Context field detection happens BEFORE row accumulation starts,
+ * exactly like the working radio service.
  */
 @Service
 @Slf4j
 public class GenericExtractionEngine {
 
     private final TenantConfigService configService;
+    
+    private static final Set<String> TOTAL_LINE_INDICATORS = Set.of(
+            "sub total", "grand total", "total for", "net amount", "gross amount"
+    );
 
     public GenericExtractionEngine(TenantConfigService configService) {
         this.configService = configService;
     }
 
-    /**
-     * Main entry point - works for ALL invoice types
-     */
     public ExtractionResult extract(String pdfText, InvoiceTenant tenant) {
         ExtractionResult result = new ExtractionResult();
         result.setTenantKey(tenant.getTenantKey());
         result.setTenantName(tenant.getDisplayName());
 
-        // Preprocess text for better extraction
-        String preprocessed = preprocessText(pdfText);
-        
-        // Group configurations
         Map<String, List<TenantFieldDef>> fieldsByBlock = tenant.getFieldDefs().stream()
                 .collect(Collectors.groupingBy(TenantFieldDef::getBlockName));
-        
+
         Map<String, TenantBlockConfig> configByBlock = tenant.getBlockConfigs().stream()
                 .collect(Collectors.toMap(TenantBlockConfig::getBlockName, c -> c));
-        
+
         Map<String, String> cityMappings = configService.getCityMappings(tenant.getId());
 
-        // Process each block
         for (Map.Entry<String, TenantBlockConfig> entry : configByBlock.entrySet()) {
             String blockName = entry.getKey();
             TenantBlockConfig blockConfig = entry.getValue();
@@ -62,42 +55,18 @@ public class GenericExtractionEngine {
             boolean hasContextFields = fieldDefs.stream().anyMatch(TenantFieldDef::isContext);
 
             List<ExtractedRow> rows = hasContextFields
-                    ? extractWithContext(preprocessed, blockConfig, fieldDefs, cityMappings)
-                    : extractSimple(preprocessed, blockConfig, fieldDefs, cityMappings);
+                    ? extractWithContext(pdfText, blockConfig, fieldDefs, cityMappings)
+                    : extractSimple(pdfText, blockConfig, fieldDefs, cityMappings);
 
             result.getBlockResults().put(blockName, rows);
-            
-            log.info("Block '{}' extracted {} rows (hasContext={})", blockName, rows.size(), hasContextFields);
         }
 
         result.calculateAccuracy();
         return result;
     }
 
-    /**
-     * Preprocess PDF text to normalize spacing and handle special characters
-     */
-    private String preprocessText(String text) {
-        if (text == null) return "";
-        
-        // Normalize line breaks
-        text = text.replaceAll("\\r\\n", "\n").replaceAll("\\r", "\n");
-        
-        // Remove zero-width spaces and other invisible characters
-        text = text.replaceAll("[\\u200B-\\u200D\\uFEFF]", "");
-        
-        // Normalize multiple spaces (but preserve structure)
-        // DON'T collapse all spaces - we need alignment for some formats
-        text = text.replaceAll("[ \\t]+", " ");
-        
-        // Remove completely empty lines but preserve structure
-        text = text.replaceAll("\\n\\s*\\n\\s*\\n", "\n\n");
-        
-        return text;
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
-    // SIMPLE EXTRACTION (TV, Income Tax - no context)
+    // SIMPLE EXTRACTION (TV invoices)
     // ═══════════════════════════════════════════════════════════════════════
 
     private List<ExtractedRow> extractSimple(
@@ -106,10 +75,8 @@ public class GenericExtractionEngine {
             List<TenantFieldDef> fieldDefs,
             Map<String, String> cityMappings) {
 
-        List<String> textBlocks = segmentTextImproved(pdfText, blockConfig);
+        List<String> textBlocks = segmentText(pdfText, blockConfig);
         List<ExtractedRow> rows = new ArrayList<>();
-
-        log.debug("Simple extraction: {} blocks to process", textBlocks.size());
 
         for (String block : textBlocks) {
             ExtractedRow row = extractRow(block, fieldDefs, cityMappings);
@@ -117,7 +84,6 @@ public class GenericExtractionEngine {
 
             if (score >= blockConfig.getMinScore() && passesRequiredCheck(row, fieldDefs)) {
                 rows.add(row);
-                log.trace("Extracted row with score {}: {}", score, row);
             }
         }
 
@@ -125,7 +91,8 @@ public class GenericExtractionEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // CONTEXT-AWARE EXTRACTION (Radio - hierarchical structure)
+    // CONTEXT-AWARE EXTRACTION (Radio invoices)
+    // THIS IS THE EXACT TRANSLATION OF processRows() from RadioInvoiceExtractorService
     // ═══════════════════════════════════════════════════════════════════════
 
     private List<ExtractedRow> extractWithContext(
@@ -134,7 +101,7 @@ public class GenericExtractionEngine {
             List<TenantFieldDef> allFieldDefs,
             Map<String, String> cityMappings) {
 
-        // Separate context from data fields
+        // Separate field types
         List<TenantFieldDef> contextFields = allFieldDefs.stream()
                 .filter(TenantFieldDef::isContext)
                 .sorted(Comparator.comparingInt(TenantFieldDef::getSortOrder))
@@ -145,148 +112,252 @@ public class GenericExtractionEngine {
                 .sorted(Comparator.comparingInt(TenantFieldDef::getSortOrder))
                 .toList();
 
-        log.debug("Context extraction: {} context fields, {} data fields", 
-                contextFields.size(), dataFields.size());
+        // Find the PRIMARY context field (city) - the one that resets context
+        TenantFieldDef primaryContextField = contextFields.stream()
+                .filter(TenantFieldDef::isContextResetOnMatch)
+                .findFirst()
+                .orElse(null);
 
-        // State tracking
-        Map<String, Object> currentContext = new LinkedHashMap<>();
-        List<ExtractedRow> rows = new ArrayList<>();
+        List<ExtractedRow> extractedRows = new ArrayList<>();
+        String[] lines = pdfText.split("\\n");
+
+        // === EXACT TRANSLATION OF YOUR RADIO SERVICE ===
         
-        // Multi-line row buffer
-        StringBuilder rowBuffer = new StringBuilder();
-        int rowStartLineNum = -1;
-        
-        // Compile patterns once
-        Pattern rowStartPattern = compilePattern(blockConfig.getBlockStartPattern());
-        
-        String[] lines = pdfText.split("\n");
-        
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i];
-            String trimmed = line.trim();
-            
-            if (trimmed.isEmpty()) continue;
-            
-            // === STEP 1: Check for context field updates ===
-            boolean isContextLine = false;
-            for (TenantFieldDef contextField : contextFields) {
-                String extracted = tryExtractField(line, contextField);
-                
-                if (extracted != null) {
-                    // Apply city mapping if needed
-                    if ("cityName".equals(contextField.getFieldName()) && !cityMappings.isEmpty()) {
-                        String mapped = cityMappings.get(extracted.toUpperCase().trim());
-                        if (mapped != null) extracted = mapped;
-                    }
-                    
-                    // Context reset: new context scope detected
-                    if (contextField.isContextResetOnMatch() && rowBuffer.length() > 0) {
-                        flushDataRow(rowBuffer, rows, dataFields, currentContext, 
-                                blockConfig.getMinScore(), rowStartLineNum);
-                        rowBuffer.setLength(0);
-                        rowStartLineNum = -1;
-                    }
-                    
-                    currentContext.put(contextField.getFieldName(), extracted);
-                    isContextLine = true;
-                    
-                    log.trace("Line {}: Context updated: {}={}", i+1, contextField.getFieldName(), extracted);
-                    break; // Don't check other context fields
+        String currentCity = null;  // Tracks the current context value
+        StringBuilder rowBuffer = new StringBuilder(512);
+
+        for (String line : lines) {
+            String cleanLine = line.trim();
+
+            if (cleanLine.isEmpty() || isTotalLine(cleanLine)) {
+                continue;
+            }
+
+            // === STEP 1: Update city context ===
+            // THIS IS THE KEY: Detect context BEFORE checking row start
+            String detectedCity = detectCity(cleanLine, primaryContextField, cityMappings);
+            if (detectedCity != null) {
+                finalizeRow(rowBuffer, extractedRows, contextFields, dataFields, 
+                           currentCity, blockConfig.getMinScore());
+                currentCity = detectedCity;
+
+                // CRITICAL: Check if this line is ALSO a row start
+                if (!isRowStart(cleanLine, blockConfig, contextFields)) {
+                    continue;
                 }
             }
-            
-            if (isContextLine) {
-                continue; // Skip to next line
-            }
-            
-            // === STEP 2: Detect data row boundaries ===
-            boolean isRowStart = false;
-            
-            if (rowStartPattern != null) {
-                isRowStart = rowStartPattern.matcher(trimmed).find();
-                
-                if (isRowStart) {
-                    log.trace("Line {}: Row start detected: {}", i+1, trimmed.substring(0, Math.min(50, trimmed.length())));
-                }
-            }
-            
-            // Flush previous row if new row starts
-            if (isRowStart && rowBuffer.length() > 0) {
-                flushDataRow(rowBuffer, rows, dataFields, currentContext, 
-                        blockConfig.getMinScore(), rowStartLineNum);
-                rowBuffer.setLength(0);
-                rowStartLineNum = -1;
-            }
-            
-            // === STEP 3: Accumulate data row lines ===
-            
-            // Start accumulating if:
-            // - No pattern (accumulate everything)
-            // - Pattern matched (row start)
-            // - Already accumulating (continuation)
-            boolean shouldAccumulate = rowStartPattern == null || isRowStart || rowBuffer.length() > 0;
-            
-            if (shouldAccumulate) {
-                if (rowStartLineNum == -1) {
-                    rowStartLineNum = i + 1;
-                }
-                
-                // Smart line joining - preserve important spacing
-                if (rowBuffer.length() > 0) {
-                    // Check if we need a space or if the line continues naturally
-                    char lastChar = rowBuffer.charAt(rowBuffer.length() - 1);
-                    char firstChar = trimmed.charAt(0);
-                    
-                    // Add space if both are alphanumeric or if last ends without delimiter
-                    if (Character.isLetterOrDigit(lastChar) && Character.isLetterOrDigit(firstChar)) {
-                        rowBuffer.append(" ");
-                    } else if (lastChar != ' ' && firstChar != ' ') {
-                        rowBuffer.append(" ");
-                    }
-                }
-                
-                rowBuffer.append(trimmed);
-                log.trace("Line {}: Accumulated to buffer (len={})", i+1, rowBuffer.length());
+
+            // === STEP 2: Detect new row start ===
+            if (isRowStart(cleanLine, blockConfig, contextFields)) {
+                finalizeRow(rowBuffer, extractedRows, contextFields, dataFields, 
+                           currentCity, blockConfig.getMinScore());
+                rowBuffer.append(cleanLine).append(" ");
+            } else if (rowBuffer.length() > 0) {
+                // Continue accumulating multi-line row
+                rowBuffer.append(cleanLine).append(" ");
             }
         }
-        
+
         // Flush final row
-        if (rowBuffer.length() > 0) {
-            flushDataRow(rowBuffer, rows, dataFields, currentContext, 
-                    blockConfig.getMinScore(), rowStartLineNum);
-        }
-        
-        log.debug("Context extraction complete: {} rows extracted", rows.size());
-        return rows;
+        finalizeRow(rowBuffer, extractedRows, contextFields, dataFields, 
+                   currentCity, blockConfig.getMinScore());
+
+        log.info("Context extraction completed: {} rows extracted", extractedRows.size());
+        return extractedRows;
     }
 
     /**
-     * Flush accumulated buffer as a data row
+     * EXACT TRANSLATION OF: detectCity()
+     * Detects the primary context field (city or equivalent)
      */
-    private void flushDataRow(
-            StringBuilder buffer,
-            List<ExtractedRow> rows,
-            List<TenantFieldDef> dataFields,
-            Map<String, Object> context,
-            int minScore,
-            int lineNum) {
+    private String detectCity(String line, TenantFieldDef primaryContextField,
+                              Map<String, String> cityMappings) {
+        if (primaryContextField == null) {
+            return null;
+        }
 
-        if (buffer.length() == 0) return;
-
-        String text = buffer.toString().trim();
+        String extracted = tryExtractField(line, primaryContextField);
         
-        // Skip obvious non-data lines
-        if (text.length() < 3 || isHeaderLine(text) || isFooterLine(text)) {
-            log.trace("Line {}: Skipped non-data line: {}", lineNum, 
-                    text.substring(0, Math.min(40, text.length())));
+        if (extracted != null) {
+            // Apply city mapping if available (Radio City uses 3-letter codes)
+            if (!cityMappings.isEmpty()) {
+                String mapped = cityMappings.get(extracted.toUpperCase().trim());
+                if (mapped != null) {
+                    return mapped;
+                }
+            }
+            return extracted;
+        }
+        
+        return null;
+    }
+
+    /**
+     * EXACT TRANSLATION OF: isRowStart()
+     * Priority 1: Explicit row_start_pattern
+     * Priority 2: Date pattern (context field that doesn't reset)
+     */
+    private boolean isRowStart(String line, TenantBlockConfig blockConfig,
+                               List<TenantFieldDef> contextFields) {
+        
+        // Priority 1: Specific row start pattern (Red FM, Radio City, etc.)
+        if (blockConfig.getBlockStartPattern() != null && 
+            !blockConfig.getBlockStartPattern().isBlank()) {
+            
+            Pattern rowStartPattern = compilePattern(blockConfig.getBlockStartPattern());
+            if (rowStartPattern != null && rowStartPattern.matcher(line).find()) {
+                return true;
+            }
+        }
+
+        // Priority 2: Date pattern as fallback
+        // Look for context fields that DON'T reset (like dateRange)
+        for (TenantFieldDef contextField : contextFields) {
+            if (!contextField.isContextResetOnMatch()) {
+                String extracted = tryExtractField(line, contextField);
+                if (extracted != null) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * EXACT TRANSLATION OF: finalizeRow() + extractFieldsFromText()
+     */
+    private void finalizeRow(StringBuilder buffer, List<ExtractedRow> rows,
+                            List<TenantFieldDef> contextFields,
+                            List<TenantFieldDef> dataFields,
+                            String currentCityValue,
+                            int minScore) {
+        if (buffer.length() == 0) {
             return;
         }
 
-        // Extract fields
+        String rowText = buffer.toString().trim();
+        
+        // === YOUR extractFieldsFromText() LOGIC ===
+        
         ExtractedRow row = new ExtractedRow();
         int score = 0;
+
+        // 1. Set the primary context (city)
+        TenantFieldDef primaryContext = contextFields.stream()
+                .filter(TenantFieldDef::isContextResetOnMatch)
+                .findFirst()
+                .orElse(null);
         
-        // Normalize for pattern matching
+        if (primaryContext != null && currentCityValue != null) {
+            row.put(primaryContext.getFieldName(), currentCityValue);
+            // Don't add score for context - it's inherited
+        }
+
+        // 2. Extract dates (from row text)
+        // These are context fields that DON'T reset
+        extractDates(rowText, contextFields, row);
+
+        // 3. Extract timeband (from row text)
+        extractTimeband(rowText, contextFields, row);
+
+        // 4. Extract numeric fields (spots, rate, amount, etc.)
+        extractNumericFields(rowText, dataFields, row, score);
+
+        // 5. Calculate FCT if missing
+        calculateFctIfMissing(row);
+
+        row.score(score);
+
+        // Only add rows with meaningful data
+        if (hasMinimumData(row)) {
+            rows.add(row);
+            log.debug("Extracted row: {}", row);
+        } else {
+            log.debug("Skipped incomplete row: {}", rowText.substring(0, Math.min(60, rowText.length())));
+        }
+
+        buffer.setLength(0);
+    }
+
+    /**
+     * YOUR extractDates() logic
+     */
+    private void extractDates(String text, List<TenantFieldDef> contextFields, ExtractedRow row) {
+        for (TenantFieldDef field : contextFields) {
+            if (!field.isContextResetOnMatch() && 
+                (field.getFieldName().contains("Date") || field.getFieldName().contains("date"))) {
+                
+                for (String regex : field.getExtractionPatterns()) {
+                    try {
+                        Pattern p = compilePattern(regex);
+                        if (p == null) continue;
+                        
+                        Matcher m = p.matcher(text);
+                        if (m.find()) {
+                            // Group 1: start date
+                            if (m.groupCount() >= 1) {
+                                String startDate = cleanDateValue(m.group(1));
+                                row.put("startDate", startDate);
+                            }
+                            
+                            // Group 2: end date (if present)
+                            if (m.groupCount() >= 2 && m.group(2) != null) {
+                                String endDate = cleanDateValue(m.group(2));
+                                row.put("endDate", endDate);
+                            }
+                            // Strategy 2: End date in separate match
+                            else if (m.find()) {
+                                String endDate = cleanDateValue(m.group(1));
+                                row.put("endDate", endDate);
+                            }
+                            
+                            break; // Found dates, stop
+                        }
+                    } catch (Exception e) {
+                        // Continue to next pattern
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * YOUR extractTimeband() logic
+     */
+    private void extractTimeband(String text, List<TenantFieldDef> contextFields, ExtractedRow row) {
+        for (TenantFieldDef field : contextFields) {
+            if (!field.isContextResetOnMatch() && 
+                (field.getFieldName().contains("timeband") || field.getFieldName().contains("Timeband"))) {
+                
+                for (String regex : field.getExtractionPatterns()) {
+                    try {
+                        Pattern p = compilePattern(regex);
+                        if (p == null) continue;
+                        
+                        Matcher m = p.matcher(text);
+                        if (m.find()) {
+                            if (m.groupCount() >= 1) {
+                                row.put("timebandStart", m.group(1));
+                            }
+                            if (m.groupCount() >= 2 && m.group(2) != null) {
+                                row.put("timebandEnd", m.group(2));
+                            }
+                            break;
+                        }
+                    } catch (Exception e) {
+                        // Continue
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * YOUR extractNumericFields() + applyFieldValue() logic
+     */
+    private void extractNumericFields(String text, List<TenantFieldDef> dataFields, 
+                                     ExtractedRow row, int score) {
         String normalized = text.replaceAll("\\s+", " ").trim();
         
         for (TenantFieldDef fieldDef : dataFields) {
@@ -297,85 +368,55 @@ public class GenericExtractionEngine {
                 if (parsed != null) {
                     row.put(fieldDef.getFieldName(), parsed);
                     score += fieldDef.getScore();
-                    log.trace("Line {}: Extracted {}={} (score +{})", 
-                            lineNum, fieldDef.getFieldName(), parsed, fieldDef.getScore());
                 }
             }
         }
         
-        // Derive FCT if missing (common calculation)
+        row.score(score);
+    }
+
+    /**
+     * YOUR calculateFctIfMissing() logic
+     */
+    private void calculateFctIfMissing(ExtractedRow row) {
         if (!row.containsKey("fct") && row.containsKey("spots") && row.containsKey("duration")) {
             try {
                 int spots = ((Number) row.get("spots")).intValue();
                 int duration = ((Number) row.get("duration")).intValue();
                 if (spots > 0 && duration > 0) {
-                    row.put("fct", spots * duration);
-                    log.trace("Line {}: Calculated FCT = {} * {} = {}", lineNum, spots, duration, spots * duration);
+                    int calculatedFct = spots * duration;
+                    row.put("fct", calculatedFct);
+                    log.debug("Calculated FCT: {} (spots: {}, duration: {})",
+                            calculatedFct, spots, duration);
                 }
             } catch (Exception e) {
                 // Ignore
             }
         }
-        
-        row.score(score);
-        
-        // Merge context
-        row.putAll(context);
-        
-        // Only keep rows with actual data
-        boolean hasData = row.size() > context.size() || row.containsKey("amount");
-        
-        if (hasData && score >= minScore) {
-            rows.add(row);
-            log.debug("Line {}: Extracted row with score {}: {}", lineNum, score, row);
-        } else {
-            log.trace("Line {}: Skipped low-score row (score={}, min={}): {}", 
-                    lineNum, score, minScore, text.substring(0, Math.min(60, text.length())));
-        }
     }
 
-    private boolean isHeaderLine(String text) {
-        String lower = text.toLowerCase();
-        
-        // Common header patterns
-        if (lower.matches(".*\\b(invoice|date|time|serial|s\\.?no|sr\\.?no|description)\\b.*" +
-                "\\b(rate|amount|spots|duration|programme)\\b.*")) {
-            return true;
-        }
-        
-        // Table headers
-        if (lower.matches("^(date|sr\\s*no|time|programme|description|rate|amount|spots|duration).*") &&
-                text.length() < 80) {
-            return true;
-        }
-        
-        return false;
+    /**
+     * YOUR hasMinimumData() check
+     */
+    private boolean hasMinimumData(ExtractedRow row) {
+        return row.containsKey("amount") || 
+               row.containsKey("spots") || 
+               row.containsKey("rate");
     }
 
-    private boolean isFooterLine(String text) {
-        String lower = text.toLowerCase();
-        
-        // Footers usually have pagination or disclaimers
-        if (lower.matches(".*\\bpage\\s+\\d+\\s+of\\s+\\d+.*")) {
-            return true;
-        }
-        
-        if (lower.matches("^(this|computer|system|generated|authorized|signatory).*") &&
-                text.length() < 100) {
-            return true;
-        }
-        
-        return false;
+    /**
+     * YOUR isTotalLine() logic
+     */
+    private boolean isTotalLine(String line) {
+        String lower = line.toLowerCase();
+        return TOTAL_LINE_INDICATORS.stream().anyMatch(lower::contains);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     // SHARED UTILITIES
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Improved text segmentation with better line grouping
-     */
-    private List<String> segmentTextImproved(String fullText, TenantBlockConfig config) {
+    private List<String> segmentText(String fullText, TenantBlockConfig config) {
         if (config.getBlockMode() == TenantBlockConfig.BlockMode.GLOBAL) {
             return List.of(fullText);
         }
@@ -390,54 +431,27 @@ public class GenericExtractionEngine {
         List<String> segments = new ArrayList<>();
         String[] lines = fullText.split("\n");
         StringBuilder buffer = new StringBuilder();
-        
-        int linesInCurrentBlock = 0;
-        final int MAX_LINES_PER_BLOCK = 50; // Safety limit
 
         for (String line : lines) {
             String trimmed = line.trim();
             if (trimmed.isEmpty()) continue;
 
-            boolean isBlockStart = startPattern.matcher(trimmed).find();
-            
-            if (isBlockStart) {
-                // Flush previous block
+            if (startPattern.matcher(trimmed).find()) {
                 if (buffer.length() > 0) {
                     segments.add(buffer.toString().trim());
                     buffer.setLength(0);
-                    linesInCurrentBlock = 0;
                 }
             }
-            
-            // Add line to buffer (whether it's a start or continuation)
-            if (buffer.length() > 0) {
-                buffer.append(" ");
-            }
-            buffer.append(trimmed);
-            linesInCurrentBlock++;
-            
-            // Safety: flush if block gets too large
-            if (linesInCurrentBlock >= MAX_LINES_PER_BLOCK && !isBlockStart) {
-                segments.add(buffer.toString().trim());
-                buffer.setLength(0);
-                linesInCurrentBlock = 0;
-            }
+            buffer.append(trimmed).append(" ");
         }
 
-        // Flush final block
         if (buffer.length() > 0) {
             segments.add(buffer.toString().trim());
         }
 
-        log.debug("Segmented text into {} blocks using pattern: {}", 
-                segments.size(), config.getBlockStartPattern());
-        
         return segments;
     }
 
-    /**
-     * Extract fields from a single block
-     */
     private ExtractedRow extractRow(String blockText, List<TenantFieldDef> fieldDefs,
                                     Map<String, String> cityMappings) {
         ExtractedRow row = new ExtractedRow();
@@ -455,7 +469,6 @@ public class GenericExtractionEngine {
             if (extracted != null) {
                 Object parsed = parseValue(extracted, fieldDef.getFieldType());
                 if (parsed != null) {
-                    // Apply city mapping
                     if ("cityName".equals(fieldDef.getFieldName()) && !cityMappings.isEmpty()) {
                         String mapped = cityMappings.get(extracted.toUpperCase().trim());
                         if (mapped != null) parsed = mapped;
@@ -472,49 +485,44 @@ public class GenericExtractionEngine {
     }
 
     /**
-     * Try to extract a field using all patterns with fallback strategies
+     * YOUR extractFieldValue() - try each pattern in order
      */
     private String tryExtractField(String text, TenantFieldDef fieldDef) {
-        String normalized = text.replaceAll("\\s+", " ").trim();
-        return tryExtractField(text, normalized, fieldDef);
-    }
-
-    private String tryExtractField(String original, String normalized, TenantFieldDef fieldDef) {
         for (String regex : fieldDef.getExtractionPatterns()) {
             try {
-                // Try with MULTILINE flag for patterns that span lines
-                Pattern p = Pattern.compile(regex, 
-                        Pattern.CASE_INSENSITIVE | Pattern.DOTALL | Pattern.MULTILINE);
+                Pattern pattern = compilePattern(regex);
+                if (pattern == null) continue;
+                
+                Matcher matcher = pattern.matcher(text);
 
-                // Try both original and normalized text
-                for (String candidate : List.of(original, normalized)) {
-                    Matcher m = p.matcher(candidate);
-                    if (m.find()) {
-                        // Get first capturing group
-                        if (m.groupCount() > 0) {
-                            String value = m.group(1).trim();
-                            // Clean up common artifacts
-                            value = value.replaceAll(",", ""); // Remove commas from numbers
-                            value = value.replaceAll("\\s+", " ").trim(); // Normalize spaces
-                            
-                            if (!value.isBlank()) {
-                                return value;
-                            }
-                        }
+                if (matcher.find() && matcher.groupCount() > 0) {
+                    String value = cleanNumericValue(matcher.group(1));
+                    if (!value.isBlank()) {
+                        return value;
                     }
                 }
             } catch (Exception e) {
-                log.warn("Invalid regex for field '{}': {} - {}", 
-                        fieldDef.getFieldName(), regex, e.getMessage());
+                log.debug("Failed to extract field {} with pattern: {}", 
+                         fieldDef.getFieldName(), regex);
             }
+        }
+
+        return null;
+    }
+
+    private String tryExtractField(String original, String normalized, TenantFieldDef fieldDef) {
+        // Try original first
+        String result = tryExtractField(original, fieldDef);
+        if (result != null) return result;
+        
+        // Try normalized as fallback
+        if (!original.equals(normalized)) {
+            return tryExtractField(normalized, fieldDef);
         }
         
         return null;
     }
 
-    /**
-     * Parse extracted string to appropriate type
-     */
     private Object parseValue(String raw, TenantFieldDef.FieldType type) {
         if (raw == null || raw.isBlank()) return null;
         
@@ -523,23 +531,22 @@ public class GenericExtractionEngine {
                 case STRING -> raw;
                 case INTEGER -> {
                     String cleaned = raw.replaceAll("[^0-9]", "");
-                    yield cleaned.isEmpty() ? null : Integer.parseInt(cleaned);
+                    if (cleaned.isEmpty()) yield null;
+                    yield Integer.parseInt(cleaned);
                 }
                 case DOUBLE -> {
                     String cleaned = raw.replaceAll("[^0-9.]", "");
-                    yield cleaned.isEmpty() ? null : Double.parseDouble(cleaned);
+                    if (cleaned.isEmpty()) yield null;
+                    yield Double.parseDouble(cleaned);
                 }
-                case DATE -> raw; // Keep as string for now
+                case DATE -> raw;
             };
         } catch (NumberFormatException e) {
-            log.debug("Failed to parse '{}' as {}: {}", raw, type, e.getMessage());
+            log.debug("Failed to parse '{}' as {}", raw, type);
             return null;
         }
     }
 
-    /**
-     * Check if row has all required fields
-     */
     private boolean passesRequiredCheck(ExtractedRow row, List<TenantFieldDef> fieldDefs) {
         for (TenantFieldDef def : fieldDefs) {
             if (def.isRequired() && !row.containsKey(def.getFieldName())) {
@@ -549,17 +556,22 @@ public class GenericExtractionEngine {
         return true;
     }
 
-    /**
-     * Compile regex pattern with error handling
-     */
     private Pattern compilePattern(String regex) {
         if (regex == null || regex.isBlank()) return null;
         
         try {
-            return Pattern.compile(regex, Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+            return Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
         } catch (Exception e) {
-            log.warn("Invalid regex pattern: {} - {}", regex, e.getMessage());
+            log.warn("Invalid regex pattern: {}", regex);
             return null;
         }
+    }
+
+    private String cleanNumericValue(String value) {
+        return value.replaceAll("[,\\s]", "").trim();
+    }
+
+    private String cleanDateValue(String value) {
+        return value.replaceAll("\\s+", "").trim();
     }
 }
