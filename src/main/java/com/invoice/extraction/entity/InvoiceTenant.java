@@ -12,7 +12,7 @@ import lombok.*;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@EqualsAndHashCode(exclude = {"identifiers", "fieldDefs", "blockConfigs"}) 
+@EqualsAndHashCode(exclude = {"identifiers", "fieldDefs", "blockConfigs", "fieldCalculations"}) 
 public class InvoiceTenant {
 
     @Id
@@ -40,6 +40,10 @@ public class InvoiceTenant {
     @OneToMany(mappedBy = "tenant", fetch = FetchType.LAZY)
     @Builder.Default
     private Set<TenantBlockConfig> blockConfigs = new HashSet<>();
+
+    @OneToMany(mappedBy = "tenant", fetch = FetchType.LAZY)
+    @Builder.Default
+    private Set<TenantFieldCalculation> fieldCalculations = new HashSet<>();
 
     public enum TenantStatus { ACTIVE, INACTIVE }
 }
